@@ -39,7 +39,6 @@ try:
         default_args,
         build_bulk_body,
         get_opensearch_client,
-        calculate_chunks,
     )
 except ModuleNotFoundError:
     # This path is used by Airflow at runtime (dags/ is in sys.path)
@@ -54,7 +53,6 @@ except ModuleNotFoundError:
         default_args,
         build_bulk_body,
         get_opensearch_client,
-        calculate_chunks,
     )
 
 

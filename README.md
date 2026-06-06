@@ -12,7 +12,9 @@ The migration is split across two decoupled Airflow DAGs:
 **Purpose**: Initializes the environment and prepares the migration backlog.
 - **`verify_postgres_schema`**: Bootstraps the PostgreSQL database. Creates `users` and `addresses` tables, seeds them with 1000 mock users and their addresses, and creates the `migration_tracking` table (with `user_id`, `address_id`, `type`, and `migration_status`).
 - **`create_or_verify_index`**: Connects to OpenSearch and initializes the `users` index with the correct nested mappings.
-- **`prepare_chunks`**: Scans the PostgreSQL database for eligible addresses and registers them in the `migration_tracking` table with a status of `NEW`. It inserts tracking rows in sub-batches of 100 with a targeted linear retry mechanism (3 attempts, 5-second backoff) to gracefully handle transient database locks.
+- **`get_eligible_user_chunks`**: Fetches all distinct `user_id`s with addresses and chunks them securely over XCom.
+- **`prepare_chunk`** (Dynamically Mapped): Airflow workers process the specific user IDs assigned to them in parallel. They query the address data and insert tracking rows with a targeted linear retry mechanism (3 attempts, 5-second backoff) to gracefully handle transient database locks.
+- **`summarise_preparation`**: Aggregates mapped task outputs to summarize total users and tracking rows registered.
 
 ### 2. Synchronization DAG (`migrate_user_data.py`)
 **Purpose**: The core migration engine that moves data and validates it.

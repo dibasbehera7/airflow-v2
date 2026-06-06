@@ -171,23 +171,7 @@ class TestPrepareChunk(unittest.TestCase):
 
 class TestPropertyBased(unittest.TestCase):
 
-    @settings(deadline=None)
-    @given(
-        total=integers(min_value=1, max_value=10_000_000),
-        chunk_size=integers(min_value=1, max_value=10_000),
-    )
-    def test_p1_chunks_are_contiguous_and_cover_all_rows(self, total, chunk_size):
-        specs = shared.calculate_chunks(total, chunk_size)
-        self.assertGreater(len(specs), 0)
-        self.assertEqual(specs[0]["offset"], 0)
-        for i in range(1, len(specs)):
-            self.assertEqual(specs[i]["offset"], specs[i-1]["offset"] + specs[i-1]["limit"])
-        self.assertEqual(sum(s["limit"] for s in specs), total)
 
-    @settings(deadline=None)
-    @given(chunk_size=integers(min_value=1, max_value=10_000))
-    def test_p2_empty_table_returns_no_chunks(self, chunk_size):
-        self.assertEqual(shared.calculate_chunks(0, chunk_size), [])
 
     @settings(deadline=None)
     @given(pk=one_of(integers(), text()))

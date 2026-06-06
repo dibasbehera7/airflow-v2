@@ -30,7 +30,6 @@ try:
         MAX_CONCURRENT_CHUNKS,
         default_args,
         index_body,
-        calculate_chunks,
         get_opensearch_client,
     )
 except ModuleNotFoundError:
@@ -42,7 +41,6 @@ except ModuleNotFoundError:
         MAX_CONCURRENT_CHUNKS,
         default_args,
         index_body,
-        calculate_chunks,
         get_opensearch_client,
     )
 

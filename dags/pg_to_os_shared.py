@@ -54,20 +54,6 @@ default_args = {
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
 
-def calculate_chunks(total: int, chunk_size: int) -> list[dict]:
-    """Return a list of {offset, limit} dicts that cover [0, total)."""
-    if total <= 0:
-        return []
-    num_chunks = math.ceil(total / chunk_size)
-    return [
-        {
-            "offset": i * chunk_size,
-            "limit": min(chunk_size, total - i * chunk_size),
-        }
-        for i in range(num_chunks)
-    ]
-
-
 def derive_id(row: tuple) -> str:
     """Return the OpenSearch document _id for a row (row[0] = user PK)."""
     return str(row[0])
