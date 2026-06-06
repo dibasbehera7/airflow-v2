@@ -16,6 +16,7 @@ for NEW / FAILED rows and drives the actual indexing.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 from airflow.sdk import dag, task
@@ -27,6 +28,7 @@ try:
         OS_INDEX_NAME,
         PG_SOURCE_TABLE,
         CHUNK_SIZE,
+        MAX_CONCURRENT_CHUNKS,
         default_args,
         index_body,
         calculate_chunks,
@@ -38,6 +40,7 @@ except ModuleNotFoundError:
         OS_INDEX_NAME,
         PG_SOURCE_TABLE,
         CHUNK_SIZE,
+        MAX_CONCURRENT_CHUNKS,
         default_args,
         index_body,
         calculate_chunks,
@@ -177,8 +180,9 @@ def prepare_chunks() -> list[dict]:
             for i in range(0, total, CHUNK_SIZE)
         ]
 
-        max_retries = 3
-        for batch_idx, batch_rows in enumerate(batches):
+        def _insert_batch_with_retry(batch_idx: int, batch_rows: list[tuple]) -> None:
+            # Instantiate thread-local hook to avoid concurrent connection issues
+            thread_hook = PostgresHook(postgres_conn_id="postgres_default")
             values_clause = ", ".join(f"({row[0]}, {row[1]}, '{row[2]}', 'NEW')" for row in batch_rows)
             query = f"""
                 INSERT INTO migration_tracking (user_id, address_id, type, migration_status)
@@ -186,9 +190,10 @@ def prepare_chunks() -> list[dict]:
                 ON CONFLICT (user_id, address_id) DO NOTHING
             """
 
+            max_retries = 3
             for attempt in range(1, max_retries + 1):
                 try:
-                    hook.run(query)
+                    thread_hook.run(query)
                     print(f"Batch {batch_idx + 1}/{len(batches)}: Successfully registered {len(batch_rows)} users (status=NEW).")
                     break  # Success! Exit the retry loop
                 except Exception as e:
@@ -199,8 +204,18 @@ def prepare_chunks() -> list[dict]:
                         print(f"Batch {batch_idx + 1} failed after {max_retries} attempts. Halting task.")
                         raise
 
+        # Execute batches concurrently
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHUNKS) as executor:
+            futures = {
+                executor.submit(_insert_batch_with_retry, batch_idx, batch_rows): batch_idx
+                for batch_idx, batch_rows in enumerate(batches)
+            }
+            for future in as_completed(futures):
+                # If any future raised an exception, it will re-raise here.
+                future.result()
+
         chunks = calculate_chunks(total, CHUNK_SIZE)
-        print(f"Total eligible users: {total}. Completed tracking inserts across {len(batches)} batches.")
+        print(f"Total eligible addresses: {total}. Completed tracking inserts across {len(batches)} batches using {MAX_CONCURRENT_CHUNKS} threads.")
         return chunks
 
     except Exception as e:
