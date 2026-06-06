@@ -75,7 +75,7 @@ def get_pending_chunks() -> list[list[int]]:
         hook = PostgresHook(postgres_conn_id="postgres_default")
 
         rows = hook.get_records("""
-            SELECT user_id
+            SELECT DISTINCT user_id
             FROM migration_tracking
             WHERE migration_status IN ('NEW', 'FAILED')
             ORDER BY user_id

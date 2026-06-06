@@ -104,7 +104,7 @@ class TestPrepareChunks(unittest.TestCase):
     def test_multiple_chunks_exact_divisor(self, mock_hook_cls):
         hook = MagicMock()
         # 200 users = 2 batches of 100
-        hook.get_records.return_value = [(i,) for i in range(1, 2 * shared.CHUNK_SIZE + 1)]
+        hook.get_records.return_value = [(i, i * 10, 'permanent') for i in range(1, 2 * shared.CHUNK_SIZE + 1)]
         mock_hook_cls.return_value = hook
 
         res = dag_mod.prepare_chunks.function()
@@ -115,13 +115,13 @@ class TestPrepareChunks(unittest.TestCase):
         # Verify hook.run was called twice for inserts
         self.assertEqual(hook.run.call_count, 2)
         sql = hook.run.call_args_list[0][0][0]
-        self.assertIn("ON CONFLICT (user_id) DO NOTHING", sql)
+        self.assertIn("ON CONFLICT (user_id, address_id) DO NOTHING", sql)
 
     @patch("time.sleep")
     @patch.object(dag_mod, "PostgresHook")
     def test_retry_recovery_succeeds_on_second_attempt(self, mock_hook_cls, mock_sleep):
         hook = MagicMock()
-        hook.get_records.return_value = [(1,), (2,)]
+        hook.get_records.return_value = [(1, 10, 'permanent'), (2, 20, 'office')]
         mock_hook_cls.return_value = hook
         
         # Fail the first insert, succeed on the second
@@ -138,7 +138,7 @@ class TestPrepareChunks(unittest.TestCase):
     @patch.object(dag_mod, "PostgresHook")
     def test_retry_exhaustion_raises_exception(self, mock_hook_cls, mock_sleep):
         hook = MagicMock()
-        hook.get_records.return_value = [(1,), (2,)]
+        hook.get_records.return_value = [(1, 10, 'permanent'), (2, 20, 'office')]
         mock_hook_cls.return_value = hook
         
         # Fail all 3 attempts

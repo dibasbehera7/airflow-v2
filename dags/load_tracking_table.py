@@ -116,10 +116,13 @@ def verify_postgres_schema():
         # migration_tracking: per-user lifecycle (NEW → IN_PROGRESS → COMPLETED/FAILED)
         hook.run("""
             CREATE TABLE IF NOT EXISTS migration_tracking (
-                user_id          INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                address_id       INTEGER NOT NULL REFERENCES addresses(id) ON DELETE CASCADE,
+                type             VARCHAR(50) NOT NULL,
                 migration_status VARCHAR(20) NOT NULL DEFAULT 'NEW',
                 created_at       TIMESTAMP  NOT NULL DEFAULT NOW(),
-                updated_at       TIMESTAMP  NOT NULL DEFAULT NOW()
+                updated_at       TIMESTAMP  NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (user_id, address_id)
             );
         """)
 
@@ -158,10 +161,9 @@ def prepare_chunks() -> list[dict]:
         hook = PostgresHook(postgres_conn_id="postgres_default")
 
         eligible_rows = hook.get_records("""
-            SELECT DISTINCT u.id
-            FROM users u
-            WHERE EXISTS (SELECT 1 FROM addresses a WHERE a.user_id = u.id)
-            ORDER BY u.id
+            SELECT a.user_id, a.id as address_id, a.type
+            FROM addresses a
+            ORDER BY a.user_id, a.id
         """)
 
         total = len(eligible_rows)
@@ -177,11 +179,11 @@ def prepare_chunks() -> list[dict]:
 
         max_retries = 3
         for batch_idx, batch_rows in enumerate(batches):
-            values_clause = ", ".join(f"({row[0]}, 'NEW')" for row in batch_rows)
+            values_clause = ", ".join(f"({row[0]}, {row[1]}, '{row[2]}', 'NEW')" for row in batch_rows)
             query = f"""
-                INSERT INTO migration_tracking (user_id, migration_status)
+                INSERT INTO migration_tracking (user_id, address_id, type, migration_status)
                 VALUES {values_clause}
-                ON CONFLICT (user_id) DO NOTHING
+                ON CONFLICT (user_id, address_id) DO NOTHING
             """
 
             for attempt in range(1, max_retries + 1):
