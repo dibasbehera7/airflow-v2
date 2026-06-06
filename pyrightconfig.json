@@ -4,5 +4,8 @@
   "venvPath": ".",
   "venv": ".venv",
   "typeCheckingMode": "basic",
-  "reportMissingModuleSource": "none"
+  "reportMissingModuleSource": "none",
+  "extraPaths": [
+    "dags"
+  ]
 }
