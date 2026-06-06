@@ -16,7 +16,6 @@ for NEW / FAILED rows and drives the actual indexing.
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 from airflow.sdk import dag, task
@@ -151,76 +150,104 @@ def create_or_verify_index():
         raise
 
 
-# ── Task: populate tracking table and return chunk descriptors ────────────────
+# ── Task: compute eligible user chunks ─────────────────────────────────────────
 @task
-def prepare_chunks() -> list[dict]:
+def get_eligible_user_chunks() -> list[list[int]]:
     """
-    1. Query all eligible user IDs (users with ≥1 address) ordered by id.
-    2. Batch-insert them into migration_tracking with status NEW
-       (ON CONFLICT DO NOTHING → safe to re-run).
-    3. Return [{offset, limit}, …] chunk descriptors via XCom.
+    1. Query all eligible unique user IDs (users with ≥1 address).
+    2. Batch them into chunk sizes and return for Airflow dynamic task mapping.
     """
     try:
         hook = PostgresHook(postgres_conn_id="postgres_default")
 
-        eligible_rows = hook.get_records("""
-            SELECT a.user_id, a.id as address_id, a.type
-            FROM addresses a
-            ORDER BY a.user_id, a.id
+        rows = hook.get_records("""
+            SELECT DISTINCT user_id
+            FROM addresses
+            ORDER BY user_id
         """)
 
-        total = len(eligible_rows)
+        total = len(rows)
         if total == 0:
             print(f"No eligible users found in '{PG_SOURCE_TABLE}'. Nothing to migrate.")
             return []
 
-        # 3. Sub-batched Inserts with Retries
-        batches = [
-            eligible_rows[i : i + CHUNK_SIZE]
+        all_user_ids = [r[0] for r in rows]
+        chunks = [
+            all_user_ids[i : i + CHUNK_SIZE]
             for i in range(0, total, CHUNK_SIZE)
         ]
-
-        def _insert_batch_with_retry(batch_idx: int, batch_rows: list[tuple]) -> None:
-            # Instantiate thread-local hook to avoid concurrent connection issues
-            thread_hook = PostgresHook(postgres_conn_id="postgres_default")
-            values_clause = ", ".join(f"({row[0]}, {row[1]}, '{row[2]}', 'NEW')" for row in batch_rows)
-            query = f"""
-                INSERT INTO migration_tracking (user_id, address_id, type, migration_status)
-                VALUES {values_clause}
-                ON CONFLICT (user_id, address_id) DO NOTHING
-            """
-
-            max_retries = 3
-            for attempt in range(1, max_retries + 1):
-                try:
-                    thread_hook.run(query)
-                    print(f"Batch {batch_idx + 1}/{len(batches)}: Successfully registered {len(batch_rows)} users (status=NEW).")
-                    break  # Success! Exit the retry loop
-                except Exception as e:
-                    if attempt < max_retries:
-                        print(f"Batch {batch_idx + 1} failed on attempt {attempt}: {e}. Retrying in 5 seconds...")
-                        time.sleep(5)
-                    else:
-                        print(f"Batch {batch_idx + 1} failed after {max_retries} attempts. Halting task.")
-                        raise
-
-        # Execute batches concurrently
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHUNKS) as executor:
-            futures = {
-                executor.submit(_insert_batch_with_retry, batch_idx, batch_rows): batch_idx
-                for batch_idx, batch_rows in enumerate(batches)
-            }
-            for future in as_completed(futures):
-                # If any future raised an exception, it will re-raise here.
-                future.result()
-
-        chunks = calculate_chunks(total, CHUNK_SIZE)
-        print(f"Total eligible addresses: {total}. Completed tracking inserts across {len(batches)} batches using {MAX_CONCURRENT_CHUNKS} threads.")
+        
+        print(f"Found {total} eligible users. Chunks to process: {len(chunks)}.")
         return chunks
 
     except Exception as e:
-        print(f"Error in prepare_chunks: {e}")
+        print(f"Error in get_eligible_user_chunks: {e}")
         raise
+
+
+# ── Task: insert address rows for a chunk into tracking table ────────────────
+@task(task_id="prepare_chunk", max_active_tis_per_dag=MAX_CONCURRENT_CHUNKS)
+def prepare_chunk(chunk_user_ids: list[int]) -> dict:
+    """
+    For a given chunk of users:
+    1. Query their specific address metadata.
+    2. Batch insert them into migration_tracking with status NEW.
+    """
+    if not chunk_user_ids:
+        return {"users": 0, "addresses_inserted": 0}
+
+    try:
+        hook = PostgresHook(postgres_conn_id="postgres_default")
+        ids_list = ", ".join(str(uid) for uid in chunk_user_ids)
+        
+        # Get specific address metadata
+        rows = hook.get_records(f"""
+            SELECT user_id, id as address_id, type
+            FROM addresses
+            WHERE user_id IN ({ids_list})
+        """)
+        
+        if not rows:
+            return {"users": len(chunk_user_ids), "addresses_inserted": 0}
+            
+        values_clause = ", ".join(f"({r[0]}, {r[1]}, '{r[2]}', 'NEW')" for r in rows)
+        query = f"""
+            INSERT INTO migration_tracking (user_id, address_id, type, migration_status)
+            VALUES {values_clause}
+            ON CONFLICT (user_id, address_id) DO NOTHING
+        """
+
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                hook.run(query)
+                print(f"Successfully registered {len(rows)} addresses for {len(chunk_user_ids)} users (status=NEW).")
+                break  # Success! Exit the retry loop
+            except Exception as e:
+                if attempt < max_retries:
+                    print(f"Batch insert failed on attempt {attempt}: {e}. Retrying in 5 seconds...")
+                    time.sleep(5)
+                else:
+                    print(f"Batch insert failed after {max_retries} attempts. Halting task.")
+                    raise
+
+        return {"users": len(chunk_user_ids), "addresses_inserted": len(rows)}
+
+    except Exception as e:
+        print(f"Error in prepare_chunk: {e}")
+        raise
+
+
+# ── Task: summarise the preparation ───────────────────────────────────────────
+@task
+def summarise_preparation(results: list[dict]):
+    """Aggregates results from the mapped tasks and prints a summary."""
+    total_users = sum(r.get("users", 0) for r in results if r)
+    total_addresses = sum(r.get("addresses_inserted", 0) for r in results if r)
+    print(f"--- MIGRATION PREPARATION SUMMARY ---")
+    print(f"Chunks processed      : {len(results)}")
+    print(f"Total Users Checked   : {total_users}")
+    print(f"Addresses Registered  : {total_addresses}")
 
 
 # ── DAG 1: load_tracking_table ────────────────────────────────────────────────
@@ -239,9 +266,15 @@ def prepare_chunks() -> list[dict]:
 def load_tracking_table_dag():
     verify_db = verify_postgres_schema()
     create_index = create_or_verify_index()
-    chunks_list = prepare_chunks()
+    user_chunks = get_eligible_user_chunks()
+    
+    # Map the chunks directly into the prepare tasks
+    results = prepare_chunk.expand(chunk_user_ids=user_chunks)
+    summary = summarise_preparation(results)
 
-    [verify_db, create_index] >> chunks_list
+    [verify_db, create_index] >> user_chunks
+    
+    # The summary inherently depends on all mapped tasks finishing
 
 
 # Instantiate

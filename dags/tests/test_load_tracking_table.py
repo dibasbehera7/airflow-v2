@@ -86,49 +86,64 @@ class TestCreateOrVerifyIndex(unittest.TestCase):
             dag_mod.create_or_verify_index.function()
 
 
-# ── prepare_chunks ────────────────────────────────────────────────────────────
+# ── get_eligible_user_chunks ──────────────────────────────────────────────────
 
-class TestPrepareChunks(unittest.TestCase):
+class TestGetEligibleUserChunks(unittest.TestCase):
     @patch.object(dag_mod, "PostgresHook")
     def test_zero_eligible_users_returns_empty(self, mock_hook_cls):
         hook = MagicMock()
         hook.get_records.return_value = []
         mock_hook_cls.return_value = hook
 
-        res = dag_mod.prepare_chunks.function()
-
+        res = dag_mod.get_eligible_user_chunks.function()
         self.assertEqual(res, [])
-        hook.run.assert_not_called()
 
     @patch.object(dag_mod, "PostgresHook")
     def test_multiple_chunks_exact_divisor(self, mock_hook_cls):
         hook = MagicMock()
-        # 200 users = 2 batches of 100
-        hook.get_records.return_value = [(i, i * 10, 'permanent') for i in range(1, 2 * shared.CHUNK_SIZE + 1)]
+        # 200 users = 2 chunks of 100
+        hook.get_records.return_value = [(i,) for i in range(1, 2 * shared.CHUNK_SIZE + 1)]
         mock_hook_cls.return_value = hook
 
-        res = dag_mod.prepare_chunks.function()
+        res = dag_mod.get_eligible_user_chunks.function()
 
         self.assertEqual(len(res), 2)
-        self.assertEqual(res[1]["offset"], shared.CHUNK_SIZE)
-        
-        # Verify hook.run was called twice for inserts
-        self.assertEqual(hook.run.call_count, 2)
-        sql = hook.run.call_args_list[0][0][0]
-        self.assertIn("ON CONFLICT (user_id, address_id) DO NOTHING", sql)
+        self.assertEqual(len(res[0]), shared.CHUNK_SIZE)
+        self.assertEqual(res[0][0], 1)
+        self.assertEqual(res[1][0], 101)
+
+    @patch.object(dag_mod, "PostgresHook")
+    def test_db_exception_propagates(self, mock_hook_cls):
+        hook = MagicMock()
+        hook.get_records.side_effect = Exception("DB error")
+        mock_hook_cls.return_value = hook
+
+        with self.assertRaises(Exception, msg="DB error"):
+            dag_mod.get_eligible_user_chunks.function()
+
+# ── prepare_chunk ─────────────────────────────────────────────────────────────
+
+class TestPrepareChunk(unittest.TestCase):
+    @patch.object(dag_mod, "PostgresHook")
+    def test_empty_chunk_returns_zero(self, mock_hook_cls):
+        res = dag_mod.prepare_chunk.function([])
+        self.assertEqual(res, {"users": 0, "addresses_inserted": 0})
+        mock_hook_cls.assert_not_called()
 
     @patch("time.sleep")
     @patch.object(dag_mod, "PostgresHook")
     def test_retry_recovery_succeeds_on_second_attempt(self, mock_hook_cls, mock_sleep):
         hook = MagicMock()
+        # 2 users, 2 addresses
         hook.get_records.return_value = [(1, 10, 'permanent'), (2, 20, 'office')]
         mock_hook_cls.return_value = hook
         
         # Fail the first insert, succeed on the second
         hook.run.side_effect = [Exception("Transient DB Lock"), None]
 
-        dag_mod.prepare_chunks.function()
+        res = dag_mod.prepare_chunk.function([1, 2])
 
+        self.assertEqual(res, {"users": 2, "addresses_inserted": 2})
         # hook.run called twice (1 failure, 1 success)
         self.assertEqual(hook.run.call_count, 2)
         # sleep called once for 5 seconds
@@ -138,27 +153,18 @@ class TestPrepareChunks(unittest.TestCase):
     @patch.object(dag_mod, "PostgresHook")
     def test_retry_exhaustion_raises_exception(self, mock_hook_cls, mock_sleep):
         hook = MagicMock()
-        hook.get_records.return_value = [(1, 10, 'permanent'), (2, 20, 'office')]
+        hook.get_records.return_value = [(1, 10, 'permanent')]
         mock_hook_cls.return_value = hook
         
         # Fail all 3 attempts
         hook.run.side_effect = Exception("Persistent DB Error")
 
         with self.assertRaises(Exception, msg="Persistent DB Error"):
-            dag_mod.prepare_chunks.function()
+            dag_mod.prepare_chunk.function([1])
 
         # hook.run called 3 times, sleep called 2 times
         self.assertEqual(hook.run.call_count, 3)
         self.assertEqual(mock_sleep.call_count, 2)
-
-    @patch.object(dag_mod, "PostgresHook")
-    def test_db_exception_propagates(self, mock_hook_cls):
-        hook = MagicMock()
-        hook.get_records.side_effect = Exception("DB error")
-        mock_hook_cls.return_value = hook
-
-        with self.assertRaises(Exception, msg="DB error"):
-            dag_mod.prepare_chunks.function()
 
 
 # ── Property-based tests (shared helpers) ─────────────────────────────────────
