@@ -1,0 +1,12 @@
+# Airflow core + Task SDK (apache-airflow pulls in apache-airflow-core and apache-airflow-task-sdk)
+apache-airflow>=3.2.2
+
+# Airflow providers used by DAGs
+apache-airflow-providers-postgres>=5.0.0
+
+# DAG runtime dependencies
+opensearch-py>=2.4.0
+
+# Testing
+hypothesis>=6.80.0
+pytest>=7.0.0
