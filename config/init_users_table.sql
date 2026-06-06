@@ -7,19 +7,53 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
--- Seed with sample data (only if table is empty)
+-- Seed users dynamically (1,000 records) if empty
 INSERT INTO users (name, email, status, created_at)
-SELECT name, email, status, created_at
-FROM (VALUES
-    ('Alice Johnson',   'alice.johnson@example.com',   'active',   '2024-01-15 09:30:00'::timestamp),
-    ('Bob Smith',       'bob.smith@example.com',       'active',   '2024-02-20 14:15:00'::timestamp),
-    ('Carol Williams',  'carol.williams@example.com',  'inactive', '2024-03-10 11:45:00'::timestamp),
-    ('David Brown',     'david.brown@example.com',     'active',   '2024-04-05 16:20:00'::timestamp),
-    ('Eve Davis',       'eve.davis@example.com',       'active',   '2024-05-12 08:00:00'::timestamp),
-    ('Frank Miller',    'frank.miller@example.com',    'suspended','2024-06-01 10:30:00'::timestamp),
-    ('Grace Wilson',    'grace.wilson@example.com',    'active',   '2024-07-22 13:45:00'::timestamp),
-    ('Henry Moore',     'henry.moore@example.com',     'inactive', '2024-08-18 17:00:00'::timestamp),
-    ('Ivy Taylor',      'ivy.taylor@example.com',      'active',   '2024-09-03 09:15:00'::timestamp),
-    ('Jack Anderson',   'jack.anderson@example.com',   'active',   '2024-10-28 12:30:00'::timestamp)
-) AS seed(name, email, status, created_at)
-WHERE NOT EXISTS (SELECT 1 FROM users LIMIT 1);
+SELECT 
+    'User ' || i,
+    'user.' || i || '@example.com',
+    CASE WHEN i % 10 = 0 THEN 'inactive' WHEN i % 15 = 0 THEN 'suspended' ELSE 'active' END,
+    NOW() - (i || ' minutes')::interval
+FROM generate_series(1, 1000) AS i
+ON CONFLICT (email) DO NOTHING;
+
+-- Create the addresses source table
+CREATE TABLE IF NOT EXISTS addresses (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    type VARCHAR(50) NOT NULL,
+    address VARCHAR(255) NOT NULL,
+    long DOUBLE PRECISION,
+    lati DOUBLE PRECISION
+);
+
+-- Seed addresses dynamically (2 or 3 per user) rotating through 10 Indian cities if empty
+INSERT INTO addresses (user_id, type, address, long, lati)
+SELECT 
+    u.id,
+    addr.type,
+    (ARRAY[
+        'mumbai - 400001',
+        'bangalore - 560032',
+        'delhi - 110001',
+        'chennai - 600001',
+        'hyderabad - 500001',
+        'kolkata - 700001',
+        'pune - 411001',
+        'ahmedabad - 380001',
+        'jaipur - 302001',
+        'lucknow - 226001'
+    ])[1 + ((u.id + addr.idx) % 10)],
+    (ARRAY[72.8777, 77.5946, 77.2090, 80.2707, 78.4867, 88.3639, 73.8567, 72.5714, 75.7873, 80.9462])[1 + ((u.id + addr.idx) % 10)] + ((u.id + addr.idx) % 50) * 0.001,
+    (ARRAY[19.0760, 12.9716, 28.6139, 13.0827, 17.3850, 22.5726, 18.5204, 23.0225, 26.9124, 26.8467])[1 + ((u.id + addr.idx) % 10)] + ((u.id + addr.idx) % 50) * 0.001
+FROM users u
+CROSS JOIN LATERAL (
+    SELECT 'permanent' AS type, 1 AS idx
+    UNION ALL
+    SELECT 'office' AS type, 2 AS idx
+    UNION ALL
+    -- Only generate a 3rd address ('temporary') for users where u.id % 2 = 0
+    SELECT 'temporary' AS type, 3 AS idx
+    WHERE u.id % 2 = 0
+) AS addr
+WHERE NOT EXISTS (SELECT 1 FROM addresses LIMIT 1);

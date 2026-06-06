@@ -85,30 +85,38 @@ class TestCreateOrVerifyIndex(unittest.TestCase):
 class TestPrepareChunks(unittest.TestCase):
     @patch.object(dag_mod, 'PostgresHook')
     def test_prepare_chunks_zero_rows(self, mock_pg_hook):
+        """No eligible users → empty chunk list, no tracking insert."""
         mock_hook = MagicMock()
-        mock_hook.get_first.return_value = (0,)
+        mock_hook.get_records.return_value = []
         mock_pg_hook.return_value = mock_hook
-        
+
         res = dag_mod.prepare_chunks.function()
+
         self.assertEqual(res, [])
-        mock_hook.get_first.assert_called_once()
+        mock_hook.get_records.assert_called_once()
+        mock_hook.run.assert_not_called()
 
     @patch.object(dag_mod, 'PostgresHook')
-    def test_prepare_chunks_single(self, mock_pg_hook):
+    def test_prepare_chunks_single_chunk(self, mock_pg_hook):
+        """5 000 eligible users → 1 chunk; tracking rows inserted."""
         mock_hook = MagicMock()
-        mock_hook.get_first.return_value = (5000,)
+        mock_hook.get_records.return_value = [(i,) for i in range(1, 5001)]
         mock_pg_hook.return_value = mock_hook
-        
+
         res = dag_mod.prepare_chunks.function()
+
         self.assertEqual(res, [{"offset": 0, "limit": 5000}])
+        mock_hook.run.assert_called_once()
 
     @patch.object(dag_mod, 'PostgresHook')
     def test_prepare_chunks_exact_divisor(self, mock_pg_hook):
+        """20 000 eligible users → 2 equal chunks."""
         mock_hook = MagicMock()
-        mock_hook.get_first.return_value = (20000,)
+        mock_hook.get_records.return_value = [(i,) for i in range(1, 20001)]
         mock_pg_hook.return_value = mock_hook
-        
+
         res = dag_mod.prepare_chunks.function()
+
         self.assertEqual(res, [
             {"offset": 0, "limit": 10000},
             {"offset": 10000, "limit": 10000}
@@ -116,11 +124,13 @@ class TestPrepareChunks(unittest.TestCase):
 
     @patch.object(dag_mod, 'PostgresHook')
     def test_prepare_chunks_remainder(self, mock_pg_hook):
+        """25 000 eligible users → 2 full chunks + 1 remainder chunk."""
         mock_hook = MagicMock()
-        mock_hook.get_first.return_value = (25000,)
+        mock_hook.get_records.return_value = [(i,) for i in range(1, 25001)]
         mock_pg_hook.return_value = mock_hook
-        
+
         res = dag_mod.prepare_chunks.function()
+
         self.assertEqual(res, [
             {"offset": 0, "limit": 10000},
             {"offset": 10000, "limit": 10000},
@@ -128,11 +138,25 @@ class TestPrepareChunks(unittest.TestCase):
         ])
 
     @patch.object(dag_mod, 'PostgresHook')
+    def test_prepare_chunks_tracking_insert_is_idempotent(self, mock_pg_hook):
+        """hook.run is called once with an INSERT … ON CONFLICT DO NOTHING statement."""
+        mock_hook = MagicMock()
+        mock_hook.get_records.return_value = [(1,), (2,), (3,)]
+        mock_pg_hook.return_value = mock_hook
+
+        dag_mod.prepare_chunks.function()
+
+        self.assertEqual(mock_hook.run.call_count, 1)
+        sql_called = mock_hook.run.call_args[0][0]
+        self.assertIn("ON CONFLICT", sql_called)
+        self.assertIn("DO NOTHING", sql_called)
+
+    @patch.object(dag_mod, 'PostgresHook')
     def test_prepare_chunks_exception(self, mock_pg_hook):
         mock_hook = MagicMock()
-        mock_hook.get_first.side_effect = Exception("DB error")
+        mock_hook.get_records.side_effect = Exception("DB error")
         mock_pg_hook.return_value = mock_hook
-        
+
         with self.assertRaises(Exception) as context:
             dag_mod.prepare_chunks.function()
         self.assertIn("DB error", str(context.exception))
@@ -142,50 +166,99 @@ class TestSyncChunk(unittest.TestCase):
     @patch.object(dag_mod, 'get_opensearch_client')
     @patch.object(dag_mod, 'PostgresHook')
     def test_sync_chunk_zero_rows(self, mock_pg_hook, mock_get_client):
+        """When no user IDs are returned for the chunk window, skip and return zero counts."""
         mock_hook = MagicMock()
+        # First get_records call returns user IDs; empty → early return
         mock_hook.get_records.return_value = []
         mock_pg_hook.return_value = mock_hook
-        
+
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
-        
+
         chunk = {"offset": 0, "limit": 10000}
         res = dag_mod.sync_chunk.function(chunk)
-        
+
         self.assertEqual(res, {"chunks_processed": 1, "docs_indexed": 0, "errors": 0})
         mock_client.bulk.assert_not_called()
 
     @patch.object(dag_mod, 'get_opensearch_client')
     @patch.object(dag_mod, 'PostgresHook')
     def test_sync_chunk_success(self, mock_pg_hook, mock_get_client):
+        """Happy path: user indexed and verified via _mget → COMPLETED."""
         mock_hook = MagicMock()
-        mock_hook.get_records.return_value = [
-            (1, "Alice", "alice@example.com", "active", datetime(2026, 6, 6))
+        mock_hook.get_records.side_effect = [
+            [(1,)],  # eligible user IDs in this chunk
+            [(1, "Alice", "alice@example.com", "active", datetime(2026, 6, 6),
+              [{"id": 1, "type": "permanent", "address": "mumbai - 400001",
+                "long": 12.403, "lati": 2.494}])],  # full data row
         ]
         mock_pg_hook.return_value = mock_hook
-        
+
         mock_client = MagicMock()
-        mock_client.bulk.return_value = {"errors": False}
+        mock_client.bulk.return_value = {"errors": False, "items": []}
+        # _mget returns the doc for verification
+        mock_client.mget.return_value = {
+            "docs": [{
+                "_id": "1",
+                "found": True,
+                "_source": {"addresses": [{"type": "permanent"}]}
+            }]
+        }
         mock_get_client.return_value = mock_client
-        
+
         chunk = {"offset": 0, "limit": 10000}
         res = dag_mod.sync_chunk.function(chunk)
-        
+
         self.assertEqual(res, {"chunks_processed": 1, "docs_indexed": 1, "errors": 0})
         mock_client.bulk.assert_called_once()
+        mock_client.mget.assert_called_once()
         bulk_body = mock_client.bulk.call_args[1]["body"]
         self.assertEqual(bulk_body[0]["index"]["_id"], "1")
         self.assertEqual(bulk_body[1]["name"], "Alice")
+        self.assertEqual(bulk_body[1]["addresses"][0]["address"], "mumbai - 400001")
+        # Verify COMPLETED update was called
+        update_calls = [str(call) for call in mock_hook.run.call_args_list]
+        self.assertTrue(any("COMPLETED" in c for c in update_calls))
+
+    @patch.object(dag_mod, 'get_opensearch_client')
+    @patch.object(dag_mod, 'PostgresHook')
+    def test_sync_chunk_verification_failure(self, mock_pg_hook, mock_get_client):
+        """If OpenSearch doc is not found after indexing → error count=1, FAILED tracking."""
+        mock_hook = MagicMock()
+        mock_hook.get_records.side_effect = [
+            [(1,)],
+            [(1, "Alice", "alice@example.com", "active", datetime(2026, 6, 6),
+              [{"id": 1, "type": "permanent", "address": "mumbai - 400001",
+                "long": 12.403, "lati": 2.494}])],
+        ]
+        mock_pg_hook.return_value = mock_hook
+
+        mock_client = MagicMock()
+        mock_client.bulk.return_value = {"errors": False, "items": []}
+        mock_client.mget.return_value = {
+            "docs": [{"_id": "1", "found": False}]
+        }
+        mock_get_client.return_value = mock_client
+
+        chunk = {"offset": 0, "limit": 10000}
+        res = dag_mod.sync_chunk.function(chunk)
+
+        self.assertEqual(res["errors"], 1)
+        # FAILED status must be written back to tracking
+        update_calls = [str(call) for call in mock_hook.run.call_args_list]
+        self.assertTrue(any("FAILED" in c for c in update_calls))
 
     @patch.object(dag_mod, 'get_opensearch_client')
     @patch.object(dag_mod, 'PostgresHook')
     def test_sync_chunk_doc_errors(self, mock_pg_hook, mock_get_client):
+        """Bulk index error for a doc (HTTP 400) → RuntimeError raised."""
         mock_hook = MagicMock()
-        mock_hook.get_records.return_value = [
-            (1, "Alice", "alice@example.com", "active", datetime(2026, 6, 6))
+        mock_hook.get_records.side_effect = [
+            [(1,)],
+            [(1, "Alice", "alice@example.com", "active", datetime(2026, 6, 6), [])],
         ]
         mock_pg_hook.return_value = mock_hook
-        
+
         mock_client = MagicMock()
         mock_client.bulk.return_value = {
             "errors": True,
@@ -194,18 +267,18 @@ class TestSyncChunk(unittest.TestCase):
             ]
         }
         mock_get_client.return_value = mock_client
-        
+
         chunk = {"offset": 0, "limit": 10000}
         with self.assertRaises(RuntimeError) as context:
             dag_mod.sync_chunk.function(chunk)
-        self.assertIn("Failed to index 1 documents", str(context.exception))
+        self.assertIn("failed bulk indexing", str(context.exception))
 
     @patch.object(dag_mod, 'PostgresHook')
     def test_sync_chunk_postgres_exception(self, mock_pg_hook):
         mock_hook = MagicMock()
         mock_hook.get_records.side_effect = Exception("PG connection reset")
         mock_pg_hook.return_value = mock_hook
-        
+
         chunk = {"offset": 0, "limit": 10000}
         with self.assertRaises(Exception) as context:
             dag_mod.sync_chunk.function(chunk)
@@ -215,15 +288,16 @@ class TestSyncChunk(unittest.TestCase):
     @patch.object(dag_mod, 'PostgresHook')
     def test_sync_chunk_opensearch_exception(self, mock_pg_hook, mock_get_client):
         mock_hook = MagicMock()
-        mock_hook.get_records.return_value = [
-            (1, "Alice", "alice@example.com", "active", datetime(2026, 6, 6))
+        mock_hook.get_records.side_effect = [
+            [(1,)],
+            [(1, "Alice", "alice@example.com", "active", datetime(2026, 6, 6), [])],
         ]
         mock_pg_hook.return_value = mock_hook
-        
+
         mock_client = MagicMock()
         mock_client.bulk.side_effect = Exception("OS connection Timeout")
         mock_get_client.return_value = mock_client
-        
+
         chunk = {"offset": 0, "limit": 10000}
         with self.assertRaises(Exception) as context:
             dag_mod.sync_chunk.function(chunk)
@@ -299,7 +373,20 @@ class TestPropertyBasedTests(unittest.TestCase):
 
     # Feature: postgres-to-opensearch-dag, Property 4: Idempotent bulk action type
     @settings(deadline=None)
-    @given(rows=lists(tuples(integers(), text(), text(), text(), one_of(datetimes(), none())), min_size=1))
+    @given(rows=lists(tuples(
+        integers(),
+        text(),
+        text(),
+        text(),
+        one_of(datetimes(), none()),
+        lists(fixed_dictionaries({
+            "id": integers(),
+            "type": text(),
+            "address": text(),
+            "long": one_of(integers(), none()),
+            "lati": one_of(integers(), none())
+        }))
+    ), min_size=1))
     def test_p4_action_type(self, rows):
         body = dag_mod.build_bulk_body(rows, "users")
         # Every action description (odd index items in body list) must be of "index" type
